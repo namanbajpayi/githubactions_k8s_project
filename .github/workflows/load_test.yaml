@@ -1,0 +1,11 @@
+name: Kubernetes Load Test
+on:
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  load-test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Placeholder
+        run: echo "Workflow is active"

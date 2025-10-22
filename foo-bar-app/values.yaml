@@ -1,0 +1,24 @@
+replicaCount: 1
+
+image:
+  repository: http-echo
+  tag: latest
+  pullPolicy: Never
+
+service:
+  type: ClusterIP
+  port: 8080
+
+container:
+  args: ["-listen=:8080", "-text=foo"]
+  env: []
+
+appName: foo
+
+ingress:
+  enabled: true
+  className: nginx
+  host: foo.localhost
+  path: /
+  pathType: Prefix
+  servicePort: 8080

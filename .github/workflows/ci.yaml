@@ -117,12 +117,12 @@ jobs:
           echo "" >> prom-metrics.txt
           echo "### Cluster-Wide Metrics" >> prom-metrics.txt
           
-          # Cluster CPU %
+          # Cluster CPU
           CLUSTER_CPU=$(curl -s "${PROM}?query=(1-avg(rate(node_cpu_seconds_total%7Bmode=%22idle%22%7D%5B1m%5D)))*100" | jq -r '.data.result[0].value[1] // "0"')
           CLUSTER_CPU_FMT=$(awk "BEGIN {printf \"%.2f\", $CLUSTER_CPU}")
           echo "- Cluster CPU: ${CLUSTER_CPU_FMT}%" >> prom-metrics.txt
           
-          # Cluster Memory %
+          # Cluster Memory
           CLUSTER_MEM=$(curl -s "${PROM}?query=(1-(sum(node_memory_MemAvailable_bytes)/sum(node_memory_MemTotal_bytes)))*100" | jq -r '.data.result[0].value[1] // "0"')
           CLUSTER_MEM_FMT=$(awk "BEGIN {printf \"%.2f\", $CLUSTER_MEM}")
           echo "- Cluster Memory: ${CLUSTER_MEM_FMT}%" >> prom-metrics.txt
@@ -138,9 +138,18 @@ jobs:
           echo "- Total Container CPU: ${TOTAL_CPU_FMT}%" >> prom-metrics.txt
           
           echo "" >> prom-metrics.txt
-          echo "### Per-Pod Memory Usage" >> prom-metrics.txt
-          curl -s "${PROM}?query=container_memory_working_set_bytes%7Bnamespace=%22ingress-nginx%22%7D" | \
-            jq -r '.data.result[] | "- \(.metric.pod): \(((.value[1]|tonumber)/1024/1024)|floor)MB"' >> prom-metrics.txt
+          echo "### Per-Pod Resource Usage" >> prom-metrics.txt
+          
+          # Combined CPU + Memory per pod on one line
+          for pod in $(kubectl get pods -n ingress-nginx -o name | grep -E '(bar|foo)' | cut -d'/' -f2); do
+            POD_CPU=$(curl -s "${PROM}?query=sum(rate(container_cpu_usage_seconds_total%7Bnamespace=%22ingress-nginx%22,pod=%22${pod}%22%7D%5B1m%5D))*100" | jq -r '.data.result[0].value[1] // "0"')
+            POD_CPU_FMT=$(awk "BEGIN {printf \"%.2f\", $POD_CPU}")
+            
+            POD_MEM=$(curl -s "${PROM}?query=sum(container_memory_working_set_bytes%7Bnamespace=%22ingress-nginx%22,pod=%22${pod}%22%7D)/1024/1024" | jq -r '.data.result[0].value[1] // "0"')
+            POD_MEM_FMT=$(awk "BEGIN {printf \"%.2f\", $POD_MEM}")
+            
+            echo "- ${pod}: CPU=${POD_CPU_FMT}%, Memory=${POD_MEM_FMT}MB" >> prom-metrics.txt
+          done
           
           echo "" >> prom-metrics.txt
           echo "### Summary" >> prom-metrics.txt
@@ -149,7 +158,8 @@ jobs:
           echo "- Monitoring: Prometheus + cAdvisor + Node Exporter" >> prom-metrics.txt
           
           cat prom-metrics.txt
-          echo "✅ Metrics captured successfully"
+          echo "✅ All metrics captured successfully"
+
 
       - name: Generate Report & Comment PR
         if: always()

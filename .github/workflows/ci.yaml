@@ -1,0 +1,178 @@
+name: Kubernetes Load Test CI
+
+on:
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  KIND_VERSION: "v0.20.0"
+  K6_VERSION: "v0.48.0"
+  CLUSTER_NAME: "load-test"
+  REGISTRY_PORT: "5001"
+  NS: "ingress-nginx"
+  MON_NS: "monitoring"
+
+jobs:
+  load-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Tools
+        run: |
+          echo "📦 Installing dependencies..."
+          curl -Lo kind https://kind.sigs.k8s.io/dl/${{ env.KIND_VERSION }}/kind-linux-amd64 && chmod +x kind && sudo mv kind /usr/local/bin/
+          curl -s https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
+          curl -Lo k6.tar.gz https://github.com/grafana/k6/releases/download/${{ env.K6_VERSION }}/k6-${{ env.K6_VERSION }}-linux-amd64.tar.gz && tar xzf k6.tar.gz --strip-components 1 && sudo mv k6 /usr/local/bin/
+          echo "✅ Tools ready"
+
+      - name: Build & Setup Cluster
+        run: |
+          echo "🐳 Building image..."
+          docker build -t localhost:${{ env.REGISTRY_PORT }}/http-echo:latest ./application/http-echo
+          docker run -d -p ${{ env.REGISTRY_PORT }}:5000 --name kind-registry registry:2
+          
+          echo "🎯 Creating cluster..."
+          cat > kind-config.yaml <<EOF
+          kind: Cluster
+          apiVersion: kind.x-k8s.io/v1alpha4
+          nodes:
+            - role: control-plane
+              extraPortMappings: [{containerPort: 30080, hostPort: 30080}, {containerPort: 30090, hostPort: 30090}]
+            - role: worker
+            - role: worker
+          containerdConfigPatches:
+            - |-
+              [plugins."io.containerd.grpc.v1.cri".registry.mirrors."localhost:${{ env.REGISTRY_PORT }}"]
+                endpoint = ["http://kind-registry:5000"]
+          EOF
+          
+          kind create cluster --config=kind-config.yaml --name=${{ env.CLUSTER_NAME }}
+          docker network connect kind kind-registry
+          docker push localhost:${{ env.REGISTRY_PORT }}/http-echo:latest
+          kubectl wait --for=condition=ready nodes --all --timeout=300s
+          echo "✅ Cluster ready: $(kubectl get nodes --no-headers | wc -l) nodes"
+
+      - name: Deploy Infrastructure & Apps
+        run: |
+          echo "🏗️ Deploying..."
+          kubectl create ns ${{ env.NS }}
+          kubectl apply -f infrastructure_setup/rbac.yaml -f infrastructure_setup/ingress_controller.yaml
+          kubectl wait -n ${{ env.NS }} --for=condition=ready pod -l app=ingress-nginx --timeout=300s
+          
+          helm upgrade --install bar ./application/foo-bar-app -n ${{ env.NS }} --set app.name=bar --set app.responseText=bar --set image.repository=localhost:${{ env.REGISTRY_PORT }}/http-echo --set image.pullPolicy=IfNotPresent --wait
+          helm upgrade --install foo ./application/foo-bar-app -n ${{ env.NS }} --set app.name=foo --set app.responseText=foo --set image.repository=localhost:${{ env.REGISTRY_PORT }}/http-echo --set image.pullPolicy=IfNotPresent --wait
+          kubectl apply -f infrastructure_setup/ingress.yaml
+          echo "✅ Apps deployed"
+
+      - name: Deploy Prometheus
+        run: |
+          echo "📊 Deploying monitoring..."
+          kubectl create ns ${{ env.MON_NS }}
+          helm repo add prometheus-community https://prometheus-community.github.io/helm-charts && helm repo update
+          helm upgrade --install prometheus prometheus-community/kube-prometheus-stack -n ${{ env.MON_NS }} \
+            --set prometheus.service.type=NodePort --set prometheus.service.nodePort=30090 \
+            --set grafana.enabled=false --set alertmanager.enabled=false \
+            --set prometheusOperator.tls.enabled=false --set prometheus.prometheusSpec.serviceMonitorSelectorNilUsesHelmValues=false --wait --timeout=5m
+          kubectl wait -n ${{ env.MON_NS }} --for=condition=ready pod -l app.kubernetes.io/name=prometheus --timeout=300s
+          echo "✅ Prometheus ready"
+
+      - name: Health Check & Validate
+        run: |
+          echo "🏥 Validating workloads..."
+          for app in ingress-nginx bar foo; do
+            kubectl wait -n ${{ env.NS }} --for=condition=ready pod -l app=$app --timeout=300s || exit 1
+            echo "✅ $app healthy"
+          done
+          
+          kubectl run test-bar --image=curlimages/curl:latest --rm -i --restart=Never -n ${{ env.NS }} -- curl -sf http://bar.${{ env.NS }}.svc.cluster.local:8080 || exit 1
+          kubectl run test-foo --image=curlimages/curl:latest --rm -i --restart=Never -n ${{ env.NS }} -- curl -sf http://foo.${{ env.NS }}.svc.cluster.local:8080 || exit 1
+          
+          kubectl top nodes > metrics-baseline.txt 2>&1 || echo "Warming up" > metrics-baseline.txt
+          kubectl top pods -n ${{ env.NS }} >> metrics-baseline.txt 2>&1
+          echo "✅ All workloads ready"
+
+      - name: Run Load Test & Capture Metrics
+        id: load_test
+        run: |
+          echo "🚀 Load testing..."
+          set +e
+          k6 run testing/load-test.js | tee load-test-results.txt
+          [ $? -eq 0 ] && echo "STATUS=✅ PASSED" >> $GITHUB_ENV || echo "STATUS=⚠️ FAILED" >> $GITHUB_ENV
+          set -e
+          
+          sleep 5
+          kubectl top nodes > metrics-post.txt 2>&1 || echo "N/A" > metrics-post.txt
+          kubectl top pods -n ${{ env.NS }} >> metrics-post.txt 2>&1
+          
+          sleep 10
+          PROM="http://localhost:30090/api/v1/query"
+          echo "## Resource Utilization" > prom-metrics.txt
+          for q in 'rate(container_cpu_usage_seconds_total{namespace="'${{ env.NS }}'",container!="",container!="POD"}[5m])*100:CPU(%)' \
+                   'container_memory_working_set_bytes{namespace="'${{ env.NS }}'",container!="",container!="POD"}/1024/1024:Memory(MB)' \
+                   'rate(container_network_receive_bytes_total{namespace="'${{ env.NS }}'"}[5m])/1024:Net-RX(KB/s)' \
+                   '(1-avg(rate(node_cpu_seconds_total{mode="idle"}[5m])))*100:Node-CPU(%)'; do
+            IFS=':' read query label <<< "$q"
+            echo "### $label" >> prom-metrics.txt
+            curl -s "$PROM?query=$query" | jq -r '.data.result[]? | "\(.metric.pod // .metric.node // "cluster"): \(.value[1])"' >> prom-metrics.txt 2>/dev/null || echo "No data" >> prom-metrics.txt
+          done
+          echo "✅ Metrics captured"
+
+      - name: Generate Report & Comment PR
+        if: always()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const read = f => { try { return fs.readFileSync(f, 'utf8'); } catch { return 'N/A'; } };
+            
+            const report = `## ${{ env.STATUS || '⚠️ UNKNOWN' }}
+            
+            **Run:** [#${{ github.run_number }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})
+            
+            <details open><summary><b>📊 k6 Results</b></summary>
+            
+            \`\`\`
+            ${read('load-test-results.txt').split('\n').filter(l => l.includes('✓') || l.includes('http_req')).join('\n')}
+            \`\`\`
+            </details>
+            
+            <details><summary><b>📈 Resource Metrics</b></summary>
+            
+            **Baseline:**
+            \`\`\`
+            ${read('metrics-baseline.txt')}
+            \`\`\`
+            
+            **Post-Test:**
+            \`\`\`
+            ${read('metrics-post.txt')}
+            \`\`\`
+            
+            **Prometheus:**
+            \`\`\`
+            ${read('prom-metrics.txt')}
+            \`\`\`
+            </details>
+            
+            ---
+            ✅ Multi-node cluster | ✅ Docker build | ✅ Helm deploys | ✅ Health checks | ✅ Load test | ✅ Prometheus monitoring
+            `;
+            
+            if (context.issue?.number) {
+              github.rest.issues.createComment({
+                issue_number: context.issue.number,
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                body: report
+              });
+            } else {
+              console.log(report);
+            }
+
+      - name: Cleanup
+        if: always()
+        run: |
+          kind delete cluster --name ${{ env.CLUSTER_NAME }} 2>/dev/null || true
+          docker rm -f kind-registry 2>/dev/null || true

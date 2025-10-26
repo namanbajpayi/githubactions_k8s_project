@@ -5,6 +5,11 @@ on:
     branches: [main]
   workflow_dispatch:
 
+permissions:
+  contents: read
+  issues: write
+  pull-requests: write
+  
 env:
   KIND_VERSION: "v0.20.0"
   K6_VERSION: "v0.48.0"
@@ -89,6 +94,9 @@ jobs:
           kubectl run test-bar --image=curlimages/curl:latest --rm -i --restart=Never -n ${{ env.NS }} -- curl -sf http://bar.${{ env.NS }}.svc.cluster.local:8080 || exit 1
           kubectl run test-foo --image=curlimages/curl:latest --rm -i --restart=Never -n ${{ env.NS }} -- curl -sf http://foo.${{ env.NS }}.svc.cluster.local:8080 || exit 1
           
+          echo "⏳ Waiting for metrics server..."
+          sleep 30  # Give metrics server time to collect data
+
           kubectl top nodes > metrics-baseline.txt 2>&1 || echo "Warming up" > metrics-baseline.txt
           kubectl top pods -n ${{ env.NS }} >> metrics-baseline.txt 2>&1
           echo "✅ All workloads ready"

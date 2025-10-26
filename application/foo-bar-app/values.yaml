@@ -1,0 +1,27 @@
+# Default values for http-echo-foo-bar app chart
+replicaCount: 2
+
+image:
+  repository: http-echo
+  pullPolicy: IfNotPresent
+  tag: "latest"
+
+service:
+  type: ClusterIP
+  port: 8080
+
+resources:
+  limits:
+    cpu: 100m
+    memory: 128Mi
+  requests:
+    cpu: 50m
+    memory: 64Mi
+
+# Application-specific configuration
+app:
+  name: ""
+  responseText: ""
+  listenPort: 8080
+
+namespace: ingress-nginx

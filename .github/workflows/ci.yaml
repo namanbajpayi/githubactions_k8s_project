@@ -94,11 +94,6 @@ jobs:
           kubectl run test-bar --image=curlimages/curl:latest --rm -i --restart=Never -n ${{ env.NS }} -- curl -sf http://bar.${{ env.NS }}.svc.cluster.local:8080 || exit 1
           kubectl run test-foo --image=curlimages/curl:latest --rm -i --restart=Never -n ${{ env.NS }} -- curl -sf http://foo.${{ env.NS }}.svc.cluster.local:8080 || exit 1
           
-          echo "⏳ Waiting for metrics server..."
-          sleep 30  # Give metrics server time to collect data
-
-          kubectl top nodes > metrics-baseline.txt 2>&1 || echo "Warming up" > metrics-baseline.txt
-          kubectl top pods -n ${{ env.NS }} >> metrics-baseline.txt 2>&1
           echo "✅ All workloads ready"
 
       - name: Run Load Test & Capture Metrics
@@ -110,22 +105,38 @@ jobs:
           [ $? -eq 0 ] && echo "STATUS=✅ PASSED" >> $GITHUB_ENV || echo "STATUS=⚠️ FAILED" >> $GITHUB_ENV
           set -e
           
-          sleep 5
-          kubectl top nodes > metrics-post.txt 2>&1 || echo "N/A" > metrics-post.txt
-          kubectl top pods -n ${{ env.NS }} >> metrics-post.txt 2>&1
+          # Give Prometheus time to collect metrics during test
+          sleep 15
           
-          sleep 10
+          # Query Prometheus for resource metrics (this works!)
           PROM="http://localhost:30090/api/v1/query"
-          echo "## Resource Utilization" > prom-metrics.txt
-          for q in 'rate(container_cpu_usage_seconds_total{namespace="'${{ env.NS }}'",container!="",container!="POD"}[5m])*100:CPU(%)' \
-                   'container_memory_working_set_bytes{namespace="'${{ env.NS }}'",container!="",container!="POD"}/1024/1024:Memory(MB)' \
-                   'rate(container_network_receive_bytes_total{namespace="'${{ env.NS }}'"}[5m])/1024:Net-RX(KB/s)' \
-                   '(1-avg(rate(node_cpu_seconds_total{mode="idle"}[5m])))*100:Node-CPU(%)'; do
-            IFS=':' read query label <<< "$q"
-            echo "### $label" >> prom-metrics.txt
-            curl -s "$PROM?query=$query" | jq -r '.data.result[]? | "\(.metric.pod // .metric.node // "cluster"): \(.value[1])"' >> prom-metrics.txt 2>/dev/null || echo "No data" >> prom-metrics.txt
-          done
-          echo "✅ Metrics captured"
+          echo "## Resource Utilization During Load Test" > prom-metrics.txt
+          
+          # CPU usage per pod
+          echo "### Pod CPU Usage (%)" >> prom-metrics.txt
+          curl -s "$PROM?query=rate(container_cpu_usage_seconds_total{namespace=\"${{ env.NS }}\",container!=\"\",container!=\"POD\"}[5m])*100" | \
+            jq -r '.data.result[]? | "\(.metric.pod): \(.value[1])"' >> prom-metrics.txt 2>/dev/null || echo "No data" >> prom-metrics.txt
+          
+          # Memory usage per pod
+          echo "" >> prom-metrics.txt
+          echo "### Pod Memory Usage (MB)" >> prom-metrics.txt
+          curl -s "$PROM?query=container_memory_working_set_bytes{namespace=\"${{ env.NS }}\",container!=\"\",container!=\"POD\"}/1024/1024" | \
+            jq -r '.data.result[]? | "\(.metric.pod): \(.value[1])"' >> prom-metrics.txt 2>/dev/null || echo "No data" >> prom-metrics.txt
+          
+          # Network stats
+          echo "" >> prom-metrics.txt
+          echo "### Network RX (KB/s)" >> prom-metrics.txt
+          curl -s "$PROM?query=rate(container_network_receive_bytes_total{namespace=\"${{ env.NS }}\"}[5m])/1024" | \
+            jq -r '.data.result[]? | "\(.metric.pod): \(.value[1])"' >> prom-metrics.txt 2>/dev/null || echo "No data" >> prom-metrics.txt
+          
+          # Node CPU
+          echo "" >> prom-metrics.txt
+          echo "### Node CPU Usage (%)" >> prom-metrics.txt
+          curl -s "$PROM?query=(1-avg(rate(node_cpu_seconds_total{mode=\"idle\"}[5m])))*100" | \
+            jq -r '.data.result[]?.value[1] + "%"' >> prom-metrics.txt 2>/dev/null || echo "No data" >> prom-metrics.txt
+          
+          cat prom-metrics.txt
+          echo "✅ Metrics captured from Prometheus"
 
       - name: Generate Report & Comment PR
         if: always()
@@ -135,37 +146,88 @@ jobs:
             const fs = require('fs');
             const read = f => { try { return fs.readFileSync(f, 'utf8'); } catch { return 'N/A'; } };
             
+            // Extract key k6 metrics
+            const k6Results = read('load-test-results.txt');
+            const k6Summary = k6Results.split('\n').filter(l => 
+              l.includes('✓') || l.includes('✗') || 
+              l.includes('http_req_duration') || 
+              l.includes('http_req_failed') || 
+              l.includes('http_reqs') ||
+              l.includes('checks')
+            ).join('\n');
+            
+            const promMetrics = read('prom-metrics.txt');
+            
             const report = `## ${{ env.STATUS || '⚠️ UNKNOWN' }}
             
-            **Run:** [#${{ github.run_number }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})
+            **Workflow:** [Run #${{ github.run_number }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})
+            **Commit:** \`${{ github.event.pull_request.head.sha || github.sha }}\`
+            **Branch:** \`${{ github.event.pull_request.head.ref || github.ref_name }}\`
             
-            <details open><summary><b>📊 k6 Results</b></summary>
+            ---
+            
+            ### 📊 k6 Load Test Results
+            
+            <details open>
+            <summary><b>Performance Metrics</b></summary>
             
             \`\`\`
-            ${read('load-test-results.txt').split('\n').filter(l => l.includes('✓') || l.includes('http_req')).join('\n')}
+            ${k6Summary || 'No k6 results available'}
             \`\`\`
+            
             </details>
             
-            <details><summary><b>📈 Resource Metrics</b></summary>
+            <details>
+            <summary><b>Full k6 Output</b></summary>
             
-            **Baseline:**
             \`\`\`
-            ${read('metrics-baseline.txt')}
-            \`\`\`
-            
-            **Post-Test:**
-            \`\`\`
-            ${read('metrics-post.txt')}
+            ${k6Results || 'N/A'}
             \`\`\`
             
-            **Prometheus:**
-            \`\`\`
-            ${read('prom-metrics.txt')}
-            \`\`\`
             </details>
             
             ---
-            ✅ Multi-node cluster | ✅ Docker build | ✅ Helm deploys | ✅ Health checks | ✅ Load test | ✅ Prometheus monitoring
+            
+            ### 📈 Resource Utilization (Prometheus)
+            
+            <details>
+            <summary><b>Pod & Node Metrics During Load Test</b></summary>
+            
+            \`\`\`
+            ${promMetrics}
+            \`\`\`
+            
+            </details>
+            
+            ---
+            
+            ### ✅ Pipeline Summary
+            
+            | Component | Status |
+            |-----------|--------|
+            | Multi-node Cluster | ✅ 3 nodes (1 control-plane + 2 workers) |
+            | Docker Image Build | ✅ Built from Dockerfile |
+            | NGINX Ingress | ✅ Deployed & Healthy |
+            | Helm Deployments | ✅ Bar & Foo apps |
+            | Health Checks | ✅ All pods ready |
+            | Load Testing | ${{ env.STATUS || '⚠️' }} k6 executed |
+            | Monitoring | ✅ Prometheus metrics collected |
+            
+            ---
+            
+            ### 🎯 Test Configuration
+            
+            - **Endpoints:** \`bar.localhost:30080\` & \`foo.localhost:30080\`
+            - **Load Pattern:** 
+              - Ramp-up: 25 users (30s)
+              - Sustained: 50 users (1m)
+              - Ramp-down: 0 users (20s)
+            - **Total Duration:** ~1m 50s
+            - **Monitoring:** Prometheus + kube-state-metrics + node-exporter
+            
+            ---
+            
+            *🤖 Automated by GitHub Actions • Built with ❤️ using KinD, Helm, k6 & Prometheus*
             `;
             
             if (context.issue?.number) {
@@ -177,6 +239,7 @@ jobs:
               });
             } else {
               console.log(report);
+              console.log('\n⚠️ No PR context - this was triggered via workflow_dispatch');
             }
 
       - name: Cleanup

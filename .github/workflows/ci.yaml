@@ -180,57 +180,6 @@ jobs:
           cat prom-metrics.txt
           echo "✅ Metrics collected"
 
-        id: load_test
-        run: |
-          echo "🚀 Load testing..."
-          set +e
-          k6 run testing/load-test.js | tee load-test-results.txt
-          [ $? -eq 0 ] && echo "STATUS=✅ PASSED" >> $GITHUB_ENV || echo "STATUS=⚠️ FAILED" >> $GITHUB_ENV
-          set -e
-          
-          # Give Prometheus MORE time to collect metrics after test
-          echo "⏳ Waiting for Prometheus to collect metrics..."
-          sleep 45  # Increased from 15 to 45 seconds
-          
-          PROM="http://localhost:30090/api/v1/query"
-          echo "## Resource Utilization During Load Test" > prom-metrics.txt
-          echo "" >> prom-metrics.txt
-          
-          # CPU usage per pod (using 2m window instead of 5m for faster data)
-          echo "### Pod CPU Usage (%)" >> prom-metrics.txt
-          curl -s "$PROM?query=rate(container_cpu_usage_seconds_total{namespace=\"${{ env.NS }}\",container!=\"\",container!=\"POD\"}[2m])*100" 2>/dev/null | \
-            jq -r '.data.result[]? | "\(.metric.pod): \(.value[1])"' >> prom-metrics.txt 2>/dev/null || echo "No CPU data available yet" >> prom-metrics.txt
-          
-          echo "" >> prom-metrics.txt
-          
-          # Memory usage per pod
-          echo "### Pod Memory Usage (MB)" >> prom-metrics.txt
-          curl -s "$PROM?query=container_memory_working_set_bytes{namespace=\"${{ env.NS }}\",container!=\"\",container!=\"POD\"}/1024/1024" 2>/dev/null | \
-            jq -r '.data.result[]? | "\(.metric.pod): \(.value[1])"' >> prom-metrics.txt 2>/dev/null || echo "No memory data available yet" >> prom-metrics.txt
-          
-          echo "" >> prom-metrics.txt
-          
-          # Network RX (using 2m window)
-          echo "### Network RX (KB/s)" >> prom-metrics.txt
-          curl -s "$PROM?query=rate(container_network_receive_bytes_total{namespace=\"${{ env.NS }}\"}[2m])/1024" 2>/dev/null | \
-            jq -r '.data.result[]? | "\(.metric.pod): \(.value[1])"' >> prom-metrics.txt 2>/dev/null || echo "No network data available yet" >> prom-metrics.txt
-          
-          echo "" >> prom-metrics.txt
-          
-          # Node CPU (using 2m window)
-          echo "### Cluster CPU Usage (%)" >> prom-metrics.txt
-          curl -s "$PROM?query=(1-avg(rate(node_cpu_seconds_total{mode=\"idle\"}[2m])))*100" 2>/dev/null | \
-            jq -r '(.data.result[0]?.value[1] // "N/A") + "%"' >> prom-metrics.txt 2>/dev/null || echo "No cluster CPU data available" >> prom-metrics.txt
-          
-          echo "" >> prom-metrics.txt
-          
-          # Fallback: Show pod count at least
-          echo "### Active Pods" >> prom-metrics.txt
-          kubectl get pods -n ${{ env.NS }} --no-headers | wc -l | xargs -I {} echo "Total pods running: {}" >> prom-metrics.txt
-          
-          cat prom-metrics.txt
-          echo "✅ Metrics collection complete"
-
 
       - name: Generate Report & Comment PR
         if: always()

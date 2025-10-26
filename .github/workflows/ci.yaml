@@ -99,6 +99,89 @@ jobs:
       - name: Run Load Test & Capture Metrics
         id: load_test
         run: |
+          echo "🚀 Starting load test with Prometheus monitoring..."
+          
+          # Start capturing metrics BEFORE the test (baseline)
+          echo "📊 Capturing baseline metrics..."
+          kubectl get pods -n ${{ env.NS }} -o wide > baseline-pods.txt
+          
+          # Run load test
+          set +e
+          k6 run testing/load-test.js | tee load-test-results.txt
+          TEST_EXIT=$?
+          set -e
+          
+          [ $TEST_EXIT -eq 0 ] && echo "STATUS=✅ PASSED" >> $GITHUB_ENV || echo "STATUS=⚠️ FAILED" >> $GITHUB_ENV
+          
+          # Give Prometheus time to scrape final metrics
+          echo "⏳ Waiting for Prometheus to scrape final metrics..."
+          sleep 30
+          
+          # Generate metrics report using instant queries and kubectl
+          echo "## Resource Utilization During Load Test" > prom-metrics.txt
+          echo "" >> prom-metrics.txt
+          
+          PROM="http://localhost:30090/api/v1/query"
+          
+          # Use instant values instead of rate (more reliable)
+          echo "### Container Metrics (from Prometheus)" >> prom-metrics.txt
+          
+          # Get current CPU usage (instant)
+          CPU_RESULT=$(curl -s "$PROM?query=sum(rate(container_cpu_usage_seconds_total{namespace=\"${{ env.NS }}\",container!=\"POD\",container!=\"\"}[1m]))*100" | \
+            jq -r '.data.result[0]?.value[1] // "N/A"' 2>/dev/null)
+          echo "Total CPU usage: ${CPU_RESULT}%" >> prom-metrics.txt
+          
+          # Get current memory usage
+          MEM_RESULT=$(curl -s "$PROM?query=sum(container_memory_working_set_bytes{namespace=\"${{ env.NS }}\",container!=\"POD\",container!=\"\"})/1024/1024" | \
+            jq -r '.data.result[0]?.value[1] // "N/A"' 2>/dev/null)
+          echo "Total Memory usage: ${MEM_RESULT}MB" >> prom-metrics.txt
+          
+          # Get network stats
+          NET_RX=$(curl -s "$PROM?query=sum(rate(container_network_receive_bytes_total{namespace=\"${{ env.NS }}\"}[1m]))/1024" | \
+            jq -r '.data.result[0]?.value[1] // "N/A"' 2>/dev/null)
+          echo "Network RX: ${NET_RX}KB/s" >> prom-metrics.txt
+          
+          echo "" >> prom-metrics.txt
+          echo "### Pod Details" >> prom-metrics.txt
+          
+          # List each pod with its current state
+          for pod in $(kubectl get pods -n ${{ env.NS }} -o name | grep -E '(bar|foo)'); do
+            POD_NAME=$(echo $pod | cut -d'/' -f2)
+            
+            # Try to get metrics from Prometheus
+            CPU=$(curl -s "$PROM?query=rate(container_cpu_usage_seconds_total{namespace=\"${{ env.NS }}\",pod=\"$POD_NAME\",container!=\"POD\",container!=\"\"}[1m])*100" | \
+              jq -r '.data.result[0]?.value[1] // "0"' 2>/dev/null | xargs printf "%.2f")
+            
+            MEM=$(curl -s "$PROM?query=container_memory_working_set_bytes{namespace=\"${{ env.NS }}\",pod=\"$POD_NAME\",container!=\"POD\",container!=\"\"}/1024/1024" | \
+              jq -r '.data.result[0]?.value[1] // "0"' 2>/dev/null | xargs printf "%.2f")
+            
+            echo "- $POD_NAME: CPU=${CPU}%, Memory=${MEM}MB" >> prom-metrics.txt
+          done
+          
+          echo "" >> prom-metrics.txt
+          echo "### Node Metrics" >> prom-metrics.txt
+          
+          # Node CPU
+          NODE_CPU=$(curl -s "$PROM?query=(1-avg(rate(node_cpu_seconds_total{mode=\"idle\"}[1m])))*100" | \
+            jq -r '.data.result[0]?.value[1] // "N/A"' 2>/dev/null)
+          echo "Cluster CPU: ${NODE_CPU}%" >> prom-metrics.txt
+          
+          # Node Memory
+          NODE_MEM=$(curl -s "$PROM?query=(1-(sum(node_memory_MemAvailable_bytes)/sum(node_memory_MemTotal_bytes)))*100" | \
+            jq -r '.data.result[0]?.value[1] // "N/A"' 2>/dev/null)
+          echo "Cluster Memory: ${NODE_MEM}%" >> prom-metrics.txt
+          
+          echo "" >> prom-metrics.txt
+          echo "### Summary" >> prom-metrics.txt
+          echo "Total pods monitored: $(kubectl get pods -n ${{ env.NS }} --no-headers | wc -l)" >> prom-metrics.txt
+          echo "Test duration: ~110 seconds" >> prom-metrics.txt
+          echo "Prometheus scrape interval: 15s" >> prom-metrics.txt
+          
+          cat prom-metrics.txt
+          echo "✅ Metrics collected"
+
+        id: load_test
+        run: |
           echo "🚀 Load testing..."
           set +e
           k6 run testing/load-test.js | tee load-test-results.txt

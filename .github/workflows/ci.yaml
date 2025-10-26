@@ -99,81 +99,57 @@ jobs:
       - name: Run Load Test & Capture Metrics
         id: load_test
         run: |
-          echo "📊 Waiting for Prometheus to establish baseline metrics..."
-          sleep 60  # Let Prometheus scrape 3-4 cycles (15s interval)
+          echo "📊 Waiting for Prometheus baseline..."
+          sleep 60
           
           echo "🚀 Starting load test..."
           set +e
           k6 run testing/load-test.js | tee load-test-results.txt
-          TEST_EXIT=$?
+          [ $? -eq 0 ] && echo "STATUS=✅ PASSED" >> $GITHUB_ENV || echo "STATUS=⚠️ FAILED" >> $GITHUB_ENV
           set -e
           
-          [ $TEST_EXIT -eq 0 ] && echo "STATUS=✅ PASSED" >> $GITHUB_ENV || echo "STATUS=⚠️ FAILED" >> $GITHUB_ENV
-          
-          echo "⏳ Waiting for Prometheus to capture final metrics..."
-          sleep 60  # Let Prometheus scrape metrics after test
+          echo "⏳ Waiting for final metrics..."
+          sleep 60
           
           PROM="http://localhost:30090/api/v1/query"
           
           echo "## Resource Utilization During Load Test" > prom-metrics.txt
           echo "" >> prom-metrics.txt
-          
-          # Use 1m window for recent data
           echo "### Cluster-Wide Metrics" >> prom-metrics.txt
           
-          # Total CPU
-          CPU_RAW=$(curl -s "${PROM}?query=sum(rate(container_cpu_usage_seconds_total{namespace=\"${{ env.NS }}\",container!=\"POD\",container!=\"\"}[1m]))*100" 2>/dev/null | jq -r '.data.result[0].value[1]' 2>/dev/null)
-          CPU_FMT=$(printf "%.2f" "$CPU_RAW" 2>/dev/null || echo "0.00")
+          # Cluster CPU %
+          CLUSTER_CPU=$(curl -s "${PROM}?query=(1-avg(rate(node_cpu_seconds_total%7Bmode=%22idle%22%7D%5B1m%5D)))*100" | jq -r '.data.result[0].value[1] // "0"')
+          CLUSTER_CPU_FMT=$(awk "BEGIN {printf \"%.2f\", $CLUSTER_CPU}")
+          echo "- Cluster CPU: ${CLUSTER_CPU_FMT}%" >> prom-metrics.txt
           
-          # Total Memory
-          MEM_RAW=$(curl -s "${PROM}?query=sum(container_memory_working_set_bytes{namespace=\"${{ env.NS }}\",container!=\"POD\",container!=\"\"})/1024/1024" 2>/dev/null | jq -r '.data.result[0].value[1]' 2>/dev/null)
-          MEM_FMT=$(printf "%.2f" "$MEM_RAW" 2>/dev/null || echo "0.00")
+          # Cluster Memory %
+          CLUSTER_MEM=$(curl -s "${PROM}?query=(1-(sum(node_memory_MemAvailable_bytes)/sum(node_memory_MemTotal_bytes)))*100" | jq -r '.data.result[0].value[1] // "0"')
+          CLUSTER_MEM_FMT=$(awk "BEGIN {printf \"%.2f\", $CLUSTER_MEM}")
+          echo "- Cluster Memory: ${CLUSTER_MEM_FMT}%" >> prom-metrics.txt
           
-          # Network RX
-          NET_RAW=$(curl -s "${PROM}?query=sum(rate(container_network_receive_bytes_total{namespace=\"${{ env.NS }}\"}[1m]))/1024" 2>/dev/null | jq -r '.data.result[0].value[1]' 2>/dev/null)
-          NET_FMT=$(printf "%.2f" "$NET_RAW" 2>/dev/null || echo "0.00")
+          # Total Container Memory
+          TOTAL_MEM=$(curl -s "${PROM}?query=sum(container_memory_working_set_bytes%7Bnamespace=%22ingress-nginx%22%7D)/1024/1024" | jq -r '.data.result[0].value[1] // "0"')
+          TOTAL_MEM_FMT=$(awk "BEGIN {printf \"%.2f\", $TOTAL_MEM}")
+          echo "- Total Container Memory: ${TOTAL_MEM_FMT} MB" >> prom-metrics.txt
           
-          # Cluster Memory
-          CLUSTER_MEM_RAW=$(curl -s "${PROM}?query=(1-(sum(node_memory_MemAvailable_bytes)/sum(node_memory_MemTotal_bytes)))*100" 2>/dev/null | jq -r '.data.result[0].value[1]' 2>/dev/null)
-          CLUSTER_MEM=$(printf "%.2f" "$CLUSTER_MEM_RAW" 2>/dev/null || echo "0.00")
-          
-          # Cluster CPU
-          CLUSTER_CPU_RAW=$(curl -s "${PROM}?query=(1-avg(rate(node_cpu_seconds_total{mode=\"idle\"}[1m])))*100" 2>/dev/null | jq -r '.data.result[0].value[1]' 2>/dev/null)
-          CLUSTER_CPU=$(printf "%.2f" "$CLUSTER_CPU_RAW" 2>/dev/null || echo "0.00")
-          
-          echo "- Total Container CPU: ${CPU_FMT}%" >> prom-metrics.txt
-          echo "- Total Container Memory: ${MEM_FMT} MB" >> prom-metrics.txt
-          echo "- Network RX Rate: ${NET_FMT} KB/s" >> prom-metrics.txt
-          echo "- Cluster CPU: ${CLUSTER_CPU}%" >> prom-metrics.txt
-          echo "- Cluster Memory: ${CLUSTER_MEM}%" >> prom-metrics.txt
+          # Total Container CPU
+          TOTAL_CPU=$(curl -s "${PROM}?query=sum(rate(container_cpu_usage_seconds_total%7Bnamespace=%22ingress-nginx%22%7D%5B1m%5D))*100" | jq -r '.data.result[0].value[1] // "0"')
+          TOTAL_CPU_FMT=$(awk "BEGIN {printf \"%.2f\", $TOTAL_CPU}")
+          echo "- Total Container CPU: ${TOTAL_CPU_FMT}%" >> prom-metrics.txt
           
           echo "" >> prom-metrics.txt
-          echo "### Per-Pod Resource Usage" >> prom-metrics.txt
-          
-          # Get per-pod metrics
-          for pod in $(kubectl get pods -n ${{ env.NS }} -o name | grep -E '(bar|foo)' | cut -d'/' -f2); do
-            POD_CPU_RAW=$(curl -s "${PROM}?query=sum(rate(container_cpu_usage_seconds_total{namespace=\"${{ env.NS }}\",pod=\"$pod\",container!=\"POD\",container!=\"\"}[1m]))*100" 2>/dev/null | jq -r '.data.result[0].value[1] // "0"' 2>/dev/null)
-            POD_CPU=$(printf "%.2f" "$POD_CPU_RAW" 2>/dev/null || echo "0.00")
-            
-            POD_MEM_RAW=$(curl -s "${PROM}?query=sum(container_memory_working_set_bytes{namespace=\"${{ env.NS }}\",pod=\"$pod\",container!=\"POD\",container!=\"\"})/1024/1024" 2>/dev/null | jq -r '.data.result[0].value[1] // "0"' 2>/dev/null)
-            POD_MEM=$(printf "%.2f" "$POD_MEM_RAW" 2>/dev/null || echo "0.00")
-            
-            echo "- ${pod}: CPU=${POD_CPU}%, Memory=${POD_MEM}MB" >> prom-metrics.txt
-          done
+          echo "### Per-Pod Memory Usage" >> prom-metrics.txt
+          curl -s "${PROM}?query=container_memory_working_set_bytes%7Bnamespace=%22ingress-nginx%22%7D" | \
+            jq -r '.data.result[] | "- \(.metric.pod): \(((.value[1]|tonumber)/1024/1024)|floor)MB"' >> prom-metrics.txt
           
           echo "" >> prom-metrics.txt
           echo "### Summary" >> prom-metrics.txt
-          echo "- Total Pods Monitored: $(kubectl get pods -n ${{ env.NS }} --no-headers | wc -l)" >> prom-metrics.txt
+          echo "- Total Pods: $(kubectl get pods -n ingress-nginx --no-headers | wc -l)" >> prom-metrics.txt
           echo "- Test Duration: ~110 seconds" >> prom-metrics.txt
-          echo "- Pre-test Wait: 60s (for baseline)" >> prom-metrics.txt
-          echo "- Post-test Wait: 60s (for final metrics)" >> prom-metrics.txt
-          echo "- Monitoring: Prometheus (15s scrape interval)" >> prom-metrics.txt
+          echo "- Monitoring: Prometheus + cAdvisor + Node Exporter" >> prom-metrics.txt
           
           cat prom-metrics.txt
-          echo "✅ Metrics captured"
-
-
-
+          echo "✅ Metrics captured successfully"
 
       - name: Generate Report & Comment PR
         if: always()
